@@ -1,0 +1,4 @@
+# Legacy-friendly: re-enables TLSv1/TLSv1.1 and common legacy ciphers.
+# WARNING: weak ciphers/keys are enabled for compatibility only.
+jdk.tls.disabledAlgorithms=SSLv3, DES, MD5withRSA, \
+    DH keySize < 512, EC keySize < 224, anon, NULL
