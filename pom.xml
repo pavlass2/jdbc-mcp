@@ -72,6 +72,16 @@
             <version>19.26.0.0</version>
             <scope>runtime</scope>
         </dependency>
+        <!-- Oracle NLS data. Without this, dictionary views on databases using a non-default
+             character set fail with "Non supported character set (add orai18n.jar in your
+             classpath): EE8ISO8859P2", which broke list_tables/describe_table against Oracle.
+             Keep the version in step with ojdbc10 above. -->
+        <dependency>
+            <groupId>com.oracle.database.nls</groupId>
+            <artifactId>orai18n</artifactId>
+            <version>19.26.0.0</version>
+            <scope>runtime</scope>
+        </dependency>
         <!-- https://mvnrepository.com/artifact/com.microsoft.sqlserver/mssql-jdbc -->
         <dependency>
             <groupId>com.microsoft.sqlserver</groupId>
@@ -151,14 +161,6 @@
         <dependency>
             <groupId>org.mockito</groupId>
             <artifactId>mockito-core</artifactId>
-            <scope>test</scope>
-        </dependency>
-        <!-- H2 is a runtime dep above, but tests need it on the compile classpath
-             to seed the in-memory fixture database directly via DriverManager. -->
-        <dependency>
-            <groupId>com.h2database</groupId>
-            <artifactId>h2</artifactId>
-            <version>2.3.232</version>
             <scope>test</scope>
         </dependency>
     </dependencies>

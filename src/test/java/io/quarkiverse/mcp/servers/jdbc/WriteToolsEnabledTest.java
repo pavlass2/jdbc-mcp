@@ -51,6 +51,7 @@ class WriteToolsEnabledTest {
      */
     @BeforeAll
     static void dropFixtureTable() throws SQLException {
+        McpTestClient.newSession();
         try (Connection conn = DriverManager.getConnection(
                 McpTestClient.H2_URL, McpTestClient.H2_USER, McpTestClient.H2_PASSWORD);
                 Statement stmt = conn.createStatement()) {
@@ -119,6 +120,24 @@ class WriteToolsEnabledTest {
 
     @Test
     @Order(5)
+    @DisplayName("session-scoped state written by one tool call is visible to the next")
+    void sessionScopedStateSurvivesBetweenCalls() {
+        // A local temporary table lives and dies with the database session, so this is the H2
+        // equivalent of the Oracle VPD context from docs/context_issue.md: before session affinity
+        // the SELECT ran on a different connection and failed with "table not found".
+        McpTestClient.callTool("write_query", Map.of(
+                "query", "CREATE LOCAL TEMPORARY TABLE SESSION_SCRATCH (V INT)"));
+        McpTestClient.callTool("write_query", Map.of(
+                "query", "INSERT INTO SESSION_SCRATCH VALUES (42)"));
+
+        List<Map<String, String>> rows = McpTestClient.readQuery("SELECT V FROM SESSION_SCRATCH");
+
+        assertEquals(1, rows.size(), "the temporary table should still exist on this session");
+        assertEquals("42", rows.get(0).get("V"));
+    }
+
+    @Test
+    @Order(6)
     @DisplayName("the guardrail is a naive prefix match, not SQL parsing")
     void guardrailIsPrefixMatchOnly() {
         // Characterization test, not an endorsement: a leading comment is enough to walk a

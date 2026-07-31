@@ -27,6 +27,7 @@ class ReadToolsTest {
 
     @BeforeAll
     static void seedDatabase() throws SQLException {
+        McpTestClient.newSession();
         try (Connection conn = DriverManager.getConnection(
                 McpTestClient.H2_URL, McpTestClient.H2_USER, McpTestClient.H2_PASSWORD);
                 Statement stmt = conn.createStatement()) {

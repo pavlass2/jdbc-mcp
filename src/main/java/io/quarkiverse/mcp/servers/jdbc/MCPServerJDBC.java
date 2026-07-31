@@ -1,8 +1,6 @@
 package io.quarkiverse.mcp.servers.jdbc;
 
-import java.sql.Connection;
 import java.sql.DatabaseMetaData;
-import java.sql.DriverManager;
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
@@ -32,6 +30,9 @@ public class MCPServerJDBC {
 
     @Inject
     ToolManager toolManager;
+
+    @Inject
+    JdbcSessionManager sessions;
 
     @ConfigProperty(name = "enable.write.sql")
     Optional<Boolean> enableWriteSql;
@@ -68,17 +69,31 @@ public class MCPServerJDBC {
         }
     }
 
-    private Connection getConnection() throws SQLException {
+    /**
+     * Borrows this MCP client's database connection, reading the credentials from the request
+     * headers.
+     *
+     * <p>
+     * The lease must be closed by the caller - it holds the session lock for the duration of the
+     * tool call. Whether closing it also closes the underlying connection is up to
+     * {@link JdbcSessionManager}: with session affinity on (the default) the connection is kept so
+     * that session state such as an Oracle VPD context survives into the next tool call.
+     *
+     * @param mcpConnection the calling MCP connection, may be {@code null} if the transport did not
+     *        supply one, in which case the connection is not reused
+     */
+    private JdbcSessionManager.Lease lease(McpConnection mcpConnection) throws SQLException {
         var parameters = HttpHeaderParameterHelper.getHeaderParameters(request, new String[] {
                 "x-jdbc-url", "x-jdbc-user", "x-jdbc-password"
         });
-        return DriverManager.getConnection(parameters[0], parameters[1], parameters[2]);
+        return sessions.acquire(mcpConnection == null ? null : mcpConnection.id(),
+                parameters[0], parameters[1], parameters[2]);
     }
 
     @Tool(description = "Execute a SELECT query on the jdbc database")
-    String read_query(@ToolArg(description = "SELECT SQL query to execute") String query) {
-        try (Connection conn = getConnection();
-             Statement stmt = conn.createStatement();
+    String read_query(@ToolArg(description = "SELECT SQL query to execute") String query, McpConnection mcpConnection) {
+        try (JdbcSessionManager.Lease lease = lease(mcpConnection);
+             Statement stmt = lease.connection().createStatement();
              ResultSet rs = stmt.executeQuery(query)) {
 
             ResultSetMetaData metaData = rs.getMetaData();
@@ -108,24 +123,27 @@ public class MCPServerJDBC {
         if (enableWriteSql.orElse(false)) {
             toolManager.newTool("write_query").setDescription("Execute a INSERT, UPDATE or DELETE query on the jdbc database")
                     .addArgument("query", "INSERT, UPDATE or DELETE SQL query to execute", true, String.class)
-                    .setHandler(ta -> ToolResponse.success(write_query(ta.args().get("query").toString())))
+                    .setHandler(ta -> ToolResponse
+                            .success(write_query(ta.args().get("query").toString(), ta.connection())))
                     .register();
 
             toolManager.newTool("create_table").setDescription("Create new table in the jdbc database")
                 .addArgument("query", "CREATE TABLE SQL statement", true, String.class)
-                .setHandler(ta -> ToolResponse.success(create_table(ta.args().get("query").toString())))
+                .setHandler(ta -> ToolResponse
+                        .success(create_table(ta.args().get("query").toString(), ta.connection())))
                 .register();
         }
     }
 
 //    @Tool(description = "Execute a INSERT, UPDATE or DELETE query on the jdbc database")
-    String write_query(@ToolArg(description = "INSERT, UPDATE or DELETE SQL query to execute") String query) {
+    String write_query(@ToolArg(description = "INSERT, UPDATE or DELETE SQL query to execute") String query,
+                       McpConnection mcpConnection) {
         if (query.strip().toUpperCase().startsWith("SELECT")) {
             throw new ToolCallException("SELECT queries are not allowed for write_query", null);
         }
 
-        try (Connection conn = getConnection();
-             Statement stmt = conn.createStatement()) {
+        try (JdbcSessionManager.Lease lease = lease(mcpConnection);
+             Statement stmt = lease.connection().createStatement()) {
             stmt.executeUpdate(query);
             return "Query executed successfully";
         } catch (Exception e) {
@@ -134,11 +152,14 @@ public class MCPServerJDBC {
     }
 
     @Tool(description = "List all tables in the jdbc database")
-    String list_tables(McpLog log) {
-        log.debug("Listing tables");
-        log.error("Listing tables");
-        try (Connection conn = getConnection()) {
-            DatabaseMetaData metaData = conn.getMetaData();
+    String list_tables(McpConnection mcpConnection) {
+        // Previously this sent "Listing tables" to the client as an MCP log notification on every
+        // call - at both debug and *error* severity, which was leftover debugging. Besides the
+        // noise, emitting a notification while handling a streamable-HTTP request can consume the
+        // response before the tool result is written ("Response has already been written"), which
+        // made the call fail outright.
+        try (JdbcSessionManager.Lease lease = lease(mcpConnection)) {
+            DatabaseMetaData metaData = lease.connection().getMetaData();
             ResultSet rs = metaData.getTables(null, null, "%", new String[] { "TABLE" });
 
             List<Map<String, String>> tables = new ArrayList<>();
@@ -156,19 +177,20 @@ public class MCPServerJDBC {
     }
 
 //    @Tool(description = "Create new table in the jdbc database")
-    String create_table(@ToolArg(description = "CREATE TABLE SQL statement") String query) {
+    String create_table(@ToolArg(description = "CREATE TABLE SQL statement") String query, McpConnection mcpConnection) {
         if (!query.strip().toUpperCase().startsWith("CREATE TABLE")) {
             throw new ToolCallException("Only CREATE TABLE statements are allowed", null);
         }
-        return write_query(query);
+        return write_query(query, mcpConnection);
     }
 
     @Tool(description = "Describe table")
     String describe_table(@ToolArg(description = "Catalog name", required = false) String catalog,
                           @ToolArg(description = "Schema name", required = false) String schema,
-                          @ToolArg(description = "Table name") String table) {
-        try (Connection conn = getConnection()) {
-            DatabaseMetaData metaData = conn.getMetaData();
+                          @ToolArg(description = "Table name") String table,
+                          McpConnection mcpConnection) {
+        try (JdbcSessionManager.Lease lease = lease(mcpConnection)) {
+            DatabaseMetaData metaData = lease.connection().getMetaData();
             ResultSet rs = metaData.getColumns(catalog, schema, table, null);
 
             List<Map<String, String>> columns = new ArrayList<>();
@@ -189,10 +211,15 @@ public class MCPServerJDBC {
     }
 
     @Tool(description = "Get information about the database. Run this before anything else to know the SQL dialect, keywords etc.")
-    String database_info() {
-        try (Connection conn = getConnection()) {
-            DatabaseMetaData metaData = conn.getMetaData();
+    String database_info(McpConnection mcpConnection) {
+        try (JdbcSessionManager.Lease lease = lease(mcpConnection)) {
+            DatabaseMetaData metaData = lease.connection().getMetaData();
             Map<String, String> info = new HashMap<>();
+
+            // Tells the model whether it may split "set up the session" and "query" across two
+            // tool calls, which is the difference between working and silently getting 0 rows on
+            // a database using session-scoped security such as Oracle VPD.
+            info.put("session_state_persists_across_tool_calls", String.valueOf(lease.retained()));
 
             info.put("database_product_name", metaData.getDatabaseProductName());
             info.put("database_product_version", metaData.getDatabaseProductVersion());

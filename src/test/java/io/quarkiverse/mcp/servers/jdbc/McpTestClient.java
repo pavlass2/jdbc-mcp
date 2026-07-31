@@ -35,7 +35,78 @@ final class McpTestClient {
 
     private static final AtomicInteger REQUEST_ID = new AtomicInteger();
 
+    static final String MCP_SESSION_ID_HEADER = "Mcp-Session-Id";
+
+    /**
+     * The MCP session this client is bound to. The streamable-HTTP transport mints a new MCP
+     * connection for every request that arrives without this header, and JDBC session affinity is
+     * keyed on the MCP connection id - so a client that does not echo it back gets a new database
+     * session per call. Real clients echo it; tests must too.
+     */
+    private static volatile String mcpSessionId;
+
     private McpTestClient() {
+    }
+
+    /**
+     * Discards the current MCP session so the next call starts a new one.
+     *
+     * <p>
+     * Call from {@code @BeforeAll} in every {@code @QuarkusTest} class: a test profile change
+     * restarts the server, which invalidates any session id captured by an earlier class. The
+     * replacement session is established lazily on first use rather than here, because RestAssured
+     * is not yet pointed at the test port when a static {@code @BeforeAll} runs.
+     */
+    static void newSession() {
+        mcpSessionId = null;
+    }
+
+    /** Establishes the MCP session on first use and returns its id. */
+    private static String sessionId() {
+        String current = mcpSessionId;
+        if (current != null) {
+            return current;
+        }
+        String established = given()
+                .contentType("application/json")
+                .accept("application/json, text/event-stream")
+                .body(Map.of(
+                        "jsonrpc", "2.0",
+                        "id", REQUEST_ID.incrementAndGet(),
+                        "method", "initialize",
+                        "params", Map.of(
+                                "protocolVersion", "2025-03-26",
+                                "clientInfo", Map.of("name", "jdbc-mcp-tests", "version", "1"),
+                                "capabilities", Map.of())))
+                .when()
+                .post("/mcp")
+                .then()
+                .statusCode(200)
+                .extract()
+                .header(MCP_SESSION_ID_HEADER);
+
+        if (established == null) {
+            throw new AssertionError("Server did not return an " + MCP_SESSION_ID_HEADER + " header");
+        }
+
+        // The connection stays in INITIALIZING until the client confirms, and rejects tool calls
+        // until then with "Client not initialized yet". (A request that arrives without a session
+        // id skips this, because the patched McpMessageHandler dummy-initializes the fresh
+        // connection it creates for it.)
+        int status = given()
+                .contentType("application/json")
+                .accept("application/json, text/event-stream")
+                .header(MCP_SESSION_ID_HEADER, established)
+                .body(Map.of("jsonrpc", "2.0", "method", "notifications/initialized"))
+                .when()
+                .post("/mcp")
+                .getStatusCode();
+        if (status >= 300) {
+            throw new AssertionError("notifications/initialized was rejected with HTTP " + status);
+        }
+
+        mcpSessionId = established;
+        return established;
     }
 
     /** Sends a JSON-RPC request with the default H2 credential headers. */
@@ -58,7 +129,8 @@ final class McpTestClient {
 
         RequestSpecification request = given()
                 .contentType("application/json")
-                .accept("application/json, text/event-stream");
+                .accept("application/json, text/event-stream")
+                .header(MCP_SESSION_ID_HEADER, sessionId());
         headers.forEach(request::header);
 
         return parse(request.body(body)

@@ -176,6 +176,22 @@ To use the Docker version with Claude Desktop, add this to your `claude_desktop_
 | `jdbc.user` | Database username | - |
 | `jdbc.password` | Database password | - |
 | `enable.write.sql` | Enable SQL operations that modify data | `false` |
+| `jdbc.session.affinity` | Reuse one database connection per MCP client connection, so session state survives across tool calls (see below) | `true` |
+| `jdbc.session.idle-timeout` | How long an unused database connection is kept before closing (ISO-8601 duration) | `PT10M` |
+| `jdbc.session.max` | Maximum number of database connections kept open at once | `16` |
+
+### Session state across tool calls
+
+By default the server keeps one database connection per MCP client connection, so
+session-scoped state set in one tool call is still in effect for the next one — for
+example an Oracle VPD context set through `DBMS_SESSION.SET_CONTEXT`, an
+`ALTER SESSION`, or a session-scoped temporary table. Without this, each call ran on
+its own connection and such state was always lost.
+
+This is keyed on the MCP connection, which is stable for the STDIO and SSE transports.
+Clients using the streamable-HTTP transport must echo back the `Mcp-Session-Id` header
+the server returns, otherwise every call is treated as a new client and gets a new
+database session. Set `jdbc.session.affinity=false` to disable the behaviour entirely.
 
 ### Supported Database Types
 
