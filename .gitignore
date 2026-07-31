@@ -1,5 +1,8 @@
 #Maven
 target/
+# Project-local dependency cache (see .mvn/maven.config) - kept separate from
+# ~/.m2/repository so no artifact fetched via the internal Nexus mirror is reused here.
+.mvn/repository/
 pom.xml.tag
 pom.xml.releaseBackup
 pom.xml.versionsBackup
@@ -38,6 +41,10 @@ nb-configuration.xml
 
 # Local environment
 .env
+
+# Written into the working directory whenever the app starts, because
+# registerDriver() loads the Derby embedded driver.
+derby.log
 
 # Plugin directory
 /.quarkus/cli/plugins/
