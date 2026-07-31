@@ -37,6 +37,19 @@ public class MCPServerJDBC {
     @ConfigProperty(name = "enable.write.sql")
     Optional<Boolean> enableWriteSql;
 
+    /**
+     * Server-wide connection info, used when the request carries no JDBC headers. Required for the
+     * STDIO transport, which has no HTTP request to read headers from.
+     */
+    @ConfigProperty(name = "jdbc.url")
+    Optional<String> jdbcUrl;
+
+    @ConfigProperty(name = "jdbc.user")
+    Optional<String> jdbcUser;
+
+    @ConfigProperty(name = "jdbc.password")
+    Optional<String> jdbcPassword;
+
     @Startup
     void registerDriver() {
         try {
@@ -83,11 +96,45 @@ public class MCPServerJDBC {
      *        supply one, in which case the connection is not reused
      */
     private JdbcSessionManager.Lease lease(McpConnection mcpConnection) throws SQLException {
-        var parameters = HttpHeaderParameterHelper.getHeaderParameters(request, new String[] {
-                "x-jdbc-url", "x-jdbc-user", "x-jdbc-password"
-        });
+        String[] parameters = connectionParameters();
         return sessions.acquire(mcpConnection == null ? null : mcpConnection.id(),
                 parameters[0], parameters[1], parameters[2]);
+    }
+
+    /**
+     * Resolves the JDBC url, user and password for this call.
+     *
+     * <p>
+     * Request headers win over the server-wide {@code jdbc.*} configuration, but as a <b>set</b>:
+     * either all three come from the request or all three come from configuration. Falling back
+     * per-parameter would let a caller supply only a URL and have the server's configured
+     * credentials sent to a database of the caller's choosing.
+     *
+     * <p>
+     * Configuration is the only source under the STDIO transport, where there is no HTTP request.
+     */
+    private String[] connectionParameters() {
+        String[] fromRequest = headerParameters();
+        if (fromRequest != null && fromRequest[0] != null) {
+            return fromRequest;
+        }
+        return new String[] { jdbcUrl.orElse(null), jdbcUser.orElse(null), jdbcPassword.orElse(null) };
+    }
+
+    /**
+     * @return the JDBC headers of the current HTTP request, or {@code null} when there is no HTTP
+     *         request - which is the normal case for the STDIO transport
+     */
+    private String[] headerParameters() {
+        try {
+            return HttpHeaderParameterHelper.getHeaderParameters(request, new String[] {
+                    "x-jdbc-url", "x-jdbc-user", "x-jdbc-password"
+            });
+        } catch (RuntimeException e) {
+            // No active HTTP request context; the injected HttpServerRequest proxy cannot resolve.
+            Log.debugf("No HTTP request available, falling back to the jdbc.* configuration: %s", e.getMessage());
+            return null;
+        }
     }
 
     @Tool(description = "Execute a SELECT query on the jdbc database")

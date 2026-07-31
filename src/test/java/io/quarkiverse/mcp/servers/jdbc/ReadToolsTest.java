@@ -152,12 +152,14 @@ class ReadToolsTest {
     }
 
     @Test
-    @DisplayName("a call with no credential headers fails instead of falling back to a server-wide connection")
+    @DisplayName("a call with no credential headers fails when no connection is configured either")
     void missingCredentialsFail() {
+        // This profile sets no jdbc.url, so there is nothing to fall back to. When one *is*
+        // configured the call succeeds instead - see ConfigFallbackTest.
         JsonPath response = McpTestClient.callToolRaw(
                 "read_query", Map.of("query", "SELECT 1"), Map.of());
 
         assertTrue(McpTestClient.isFailure(response),
-                "this fork has no server-wide JDBC fallback; a header-less call must fail");
+                "with neither headers nor jdbc.url configured there is no connection to make");
     }
 }

@@ -77,7 +77,11 @@ Key points:
 
 ### Per-request credentials via HTTP headers
 
-`getConnection()` does not use a fixed datasource; it reads JDBC URL/user/password per-request from `HttpServerRequest` via `HttpHeaderParameterHelper`:
+`connectionParameters()` resolves the URL/user/password per call. Request headers win over the server-wide `jdbc.*` config, but **as a set** — either all three come from the request or all three from config. Per-parameter fallback was avoided deliberately: it would let a caller pass only `x-jdbc-url` and have the server's configured credentials sent to a database of the caller's choosing.
+
+Under STDIO there is no HTTP request, so header access throws and config is the only source; `headerParameters()` catches that and returns `null`. This is what makes the Docker image usable from STDIO clients — don't "simplify" the try/catch away.
+
+Headers are read from `HttpServerRequest` via `HttpHeaderParameterHelper`:
 - Individual headers: `x-jdbc-url`, `x-jdbc-user`, `x-jdbc-password`.
 - Or a single `x-config` header: dot-separated, Base64-encoded values in that same order (`x-jdbc-url.x-jdbc-user.x-jdbc-password`), added so MCP clients that only support one custom header (e.g. Roo Code) can still pass full connection config.
 
@@ -112,7 +116,7 @@ Things to know before changing it:
 
 | Property / env var | Purpose | Default |
 |---|---|---|
-| `jdbc.url`, `jdbc.user`, `jdbc.password` | Fallback JDBC connection info (server-wide). **Not actually read** — this fork removed the config fallback; connection info comes from headers only. | - |
+| `jdbc.url`, `jdbc.user`, `jdbc.password` | Server-wide JDBC connection info, used when the request carries no `x-jdbc-*` headers. The only source under STDIO. | - |
 | `enable.write.sql` | Enables `write_query`/`create_table` tools | `false` |
 | `jdbc.session.affinity` | Reuse one JDBC connection per MCP connection so session state survives across tool calls | `true` |
 | `jdbc.session.idle-timeout` | How long a retained connection may sit unused before it is closed (ISO-8601 duration) | `PT10M` |

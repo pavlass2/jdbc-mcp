@@ -166,6 +166,55 @@ To use the Docker version with Claude Desktop, add this to your `claude_desktop_
 }
 ```
 
+## Using it on another machine (no clone, no build)
+
+Tagged releases are published to GitHub Container Registry by
+`.github/workflows/ghcr-publish.yml`, so any machine with Docker can run the server
+without checking out this repository:
+
+```bash
+docker pull ghcr.io/<owner>/jdbc-mcp:latest
+```
+
+If the package is private, either make it public in the repository's *Packages*
+settings or run `docker login ghcr.io` first.
+
+### GitHub Copilot CLI (`~/.copilot/mcp-config.json`)
+
+STDIO transport, so there is no port to manage and no server to keep running - Copilot
+starts the container on demand:
+
+```json
+{
+  "mcpServers": {
+    "my-database": {
+      "tools": ["*"],
+      "type": "stdio",
+      "command": "docker",
+      "args": [
+        "run", "--rm", "-i",
+        "-e", "quarkus.mcp.server.stdio.enabled=true",
+        "-e", "quarkus.log.console.enable=false",
+        "-e", "quarkus.log.console.stderr=false",
+        "-e", "jdbc.url=jdbc:oracle:thin:@//dbhost:1521/SERVICE",
+        "-e", "jdbc.user=db_user",
+        "-e", "jdbc.password=db_password",
+        "ghcr.io/<owner>/jdbc-mcp:latest"
+      ]
+    }
+  }
+}
+```
+
+Add `-e enable.write.sql=true` only if the assistant needs to modify data - or to call a
+stored procedure that sets up the session, such as an Oracle VPD context.
+
+`-i` is required: without it the container gets no stdin and the MCP handshake never
+completes. `--rm` keeps a container from being left behind per invocation.
+
+Note that this file stores database credentials in plain text. Restrict its permissions,
+and prefer an account with only the rights the assistant actually needs.
+
 ## Configuration
 
 ### Environment Variables
