@@ -15,6 +15,10 @@
         <quarkus.platform.version>3.21.0</quarkus.platform.version>
         <skipITs>true</skipITs>
         <surefire-plugin.version>3.5.2</surefire-plugin.version>
+        <!-- Set to true to run OracleScriptTest against a real Oracle in a container. Off by
+             default because the image is a ~1.5 GB pull and adds minutes to the build; the
+             oracle-tests CI job turns it on. -->
+        <oracle.tests>false</oracle.tests>
     </properties>
 
     <dependencyManagement>
@@ -163,6 +167,20 @@
             <artifactId>mockito-core</artifactId>
             <scope>test</scope>
         </dependency>
+        <!-- Oracle-only behaviour (PL/SQL blocks, DBMS_OUTPUT) cannot be covered by the H2 fixture
+             database, so OracleScriptTest runs against a real Oracle in a container. Opt-in: the
+             image is a large pull, see the oracle.tests property below. Versions come from the
+             Quarkus BOM. -->
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>oracle-free</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>
@@ -197,6 +215,8 @@
                     <systemPropertyVariables>
                         <java.util.logging.manager>org.jboss.logmanager.LogManager</java.util.logging.manager>
                         <maven.home>${maven.home}</maven.home>
+                        <!-- Read by OracleScriptTest's @EnabledIfSystemProperty. -->
+                        <oracle.tests>${oracle.tests}</oracle.tests>
                     </systemPropertyVariables>
                 </configuration>
             </plugin>

@@ -54,6 +54,9 @@ class ReadToolsTest {
                 "expected the read tools, got: " + tools);
         assertFalse(tools.contains("write_query"), "write_query must stay unregistered unless enable.write.sql=true");
         assertFalse(tools.contains("create_table"), "create_table must stay unregistered unless enable.write.sql=true");
+        // A PL/SQL block is unrestricted write access, so run_script must never appear on a
+        // read-only server.
+        assertFalse(tools.contains("run_script"), "run_script must stay unregistered unless enable.write.sql=true");
     }
 
     @Test

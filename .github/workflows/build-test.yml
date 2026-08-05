@@ -27,4 +27,27 @@ jobs:
       run: ./mvnw compile
       
     - name: Run Tests
-      run: ./mvnw test 
+      run: ./mvnw test
+
+  # Kept separate from build-and-test so the fast H2 suite still reports in a minute or two. The
+  # Oracle Free image is a large pull, but PL/SQL blocks, the '/' terminator and DBMS_OUTPUT capture
+  # in run_script cannot be covered by H2 at all - see OracleScriptTest.
+  oracle-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set up JDK 17
+      uses: actions/setup-java@v3
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+        cache: maven
+
+    - name: Set execute permission for mvnw
+      run: chmod +x mvnw
+
+    - name: Run Oracle container tests
+      run: ./mvnw test -Doracle.tests=true -Dtest=OracleScriptTest -DfailIfNoSpecifiedTests=false

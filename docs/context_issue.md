@@ -2,6 +2,9 @@
 
 Date: 2026-07-07
 
+> **Status: fixed (2026-07-31).** See "Resolution" at the end of this document.
+> The analysis below is kept as the record of the original diagnosis.
+
 ## Summary
 
 An MCP server exposes an Oracle 19c database through tools
@@ -97,3 +100,64 @@ Separately (lower priority): fix the `orai18n.jar` classpath issue for
 `list_tables`/`describe_table`, and consider making `read_query` reject
 non-SELECT statements (or `write_query` reject SELECT) to match documented
 tool semantics.
+
+## Resolution (2026-07-31)
+
+### Session affinity — fixed
+
+`JdbcSessionManager` now keeps one JDBC connection per MCP client connection
+instead of opening and closing one per tool call. A sequence of tool calls in
+one conversation therefore runs on a single Oracle session, so
+`app_context_pkg.set_active_company(1)` in one call is still in effect for a
+`SELECT` against `PROTECTED_TABLE` in the next.
+
+The intended workflow now works in two calls:
+
+1. `call app_context_pkg.set_active_company(1)` (via `write_query`, which needs
+   `enable.write.sql=true`)
+2. `SELECT ... FROM PROTECTED_TABLE ...` (via `read_query`)
+
+`switch_vpd_off()` works the same way. `database_info` reports
+`session_state_persists_across_tool_calls`, so the model can tell whether it
+may rely on this.
+
+**Caveat that decides whether this works for a given client:** affinity is keyed
+on the MCP connection id. That is stable for STDIO and for SSE. For the
+streamable-HTTP transport the client must echo back the `Mcp-Session-Id` header
+the server returns; a client that does not gets a fresh MCP connection - and so
+a fresh Oracle session - on every call, exactly as before. If context still does
+not persist, check that header first.
+
+Retained connections are real Oracle sessions, so they are bounded: closed after
+`jdbc.session.idle-timeout` (default 10 minutes) of inactivity, when the client
+disconnects, or when `jdbc.session.max` (default 16) is exceeded. Set
+`jdbc.session.affinity=false` to return to the old behaviour.
+
+Covered by `SessionAffinityTest`, `SessionAffinityDisabledTest`, and a
+temporary-table test in `WriteToolsEnabledTest` that fails without the fix.
+
+### orai18n — fixed
+
+`com.oracle.database.nls:orai18n` (version-matched to `ojdbc10`) is now a
+runtime dependency, which is what the
+`Non supported character set ... EE8ISO8859P2` failure in
+`list_tables`/`describe_table` was asking for. **Not verified against the real
+original database** - it needs a run against an `EE8ISO8859P2` instance to
+confirm.
+
+### Also fixed along the way
+
+`list_tables` sent a "Listing tables" MCP log notification on every call, at
+both debug and *error* severity (leftover debugging). Beyond the noise, emitting
+a notification mid-request could consume the HTTP response before the tool
+result was written, failing the call with `Response has already been written`.
+Both calls were removed.
+
+### Not addressed
+
+`read_query` still does not enforce SELECT-only, so the observation above about
+an `INSERT` executing through it still stands. This was left alone deliberately:
+with session affinity the natural way to run `call app_context_pkg.*` is through
+a tool call, and tightening `read_query` now would break that before there is a
+dedicated mechanism for session setup. The prefix checks on `write_query` /
+`create_table` remain naive prefix matches, not a security boundary.

@@ -1,5 +1,6 @@
 package io.quarkiverse.mcp.servers.jdbc;
 
+import java.sql.Connection;
 import java.sql.DatabaseMetaData;
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
@@ -7,6 +8,7 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -143,22 +145,7 @@ public class MCPServerJDBC {
              Statement stmt = lease.connection().createStatement();
              ResultSet rs = stmt.executeQuery(query)) {
 
-            ResultSetMetaData metaData = rs.getMetaData();
-            List<Map<String, Object>> results = new ArrayList<>();
-            while (rs.next()) {
-                Map<String, Object> row = new HashMap<>();
-                for (int i = 1; i <= metaData.getColumnCount(); i++) {
-                    String columnName = metaData.getColumnName(i);
-                    Object value = rs.getObject(i);
-                    if (value != null) {
-                        row.put(columnName, value.toString());
-                    } else {
-                        row.put(columnName, null);
-                    }
-                }
-                results.add(row);
-            }
-            return mapper.writeValueAsString(results);
+            return mapper.writeValueAsString(rows(rs, Integer.MAX_VALUE));
 
         } catch (Exception e) {
             throw new ToolCallException("Query execution failed: " + e.getMessage(), e);
@@ -179,7 +166,29 @@ public class MCPServerJDBC {
                 .setHandler(ta -> ToolResponse
                         .success(create_table(ta.args().get("query").toString(), ta.connection())))
                 .register();
+
+            // A PL/SQL block can do anything write_query can and more, so this tool lives behind the
+            // same switch. There is deliberately no read-only variant: no prefix check can tell an
+            // anonymous block that reads from one that deletes.
+            toolManager.newTool("run_script").setDescription(RUN_SCRIPT_DESCRIPTION)
+                .addArgument("script", "The SQL and PL/SQL script to run, as you would write it for SQL*Plus."
+                        + " Statements are separated by ';', and PL/SQL blocks are closed by a line containing"
+                        + " only '/'.", true, String.class)
+                .addArgument("continue_on_error", "Keep running the remaining statements after one fails."
+                        + " Defaults to false, which stops at the first error.", false, Boolean.class)
+                .setHandler(ta -> ToolResponse.success(run_script(
+                        ta.args().get("script").toString(),
+                        isTrue(ta.args().get("continue_on_error")),
+                        ta.connection())))
+                .register();
         }
+    }
+
+    private static boolean isTrue(Object value) {
+        if (value instanceof Boolean bool) {
+            return bool;
+        }
+        return value != null && Boolean.parseBoolean(value.toString());
     }
 
 //    @Tool(description = "Execute a INSERT, UPDATE or DELETE query on the jdbc database")
@@ -229,6 +238,183 @@ public class MCPServerJDBC {
             throw new ToolCallException("Only CREATE TABLE statements are allowed", null);
         }
         return write_query(query, mcpConnection);
+    }
+
+    /**
+     * Everything a model needs to know to write a script this server can actually run. It is long on
+     * purpose: the alternative to explaining the terminator rules here is a model discovering them
+     * one confusing {@code ORA-00911} at a time.
+     */
+    private static final String RUN_SCRIPT_DESCRIPTION = """
+            Execute a multi-statement SQL and PL/SQL script, the way you would paste it into SQL*Plus or SQL Developer. \
+            Use this instead of write_query when you need a PL/SQL block, a stored procedure or trigger, or several \
+            statements that must run in order on one database session.
+
+            HOW TO TERMINATE STATEMENTS - this is what decides where one statement ends and the next begins:
+            - Plain SQL (SELECT, INSERT, UPDATE, DELETE, CREATE TABLE, ALTER SESSION, ...) ends at a semicolon.
+            - A PL/SQL block contains semicolons of its own, so a semicolon cannot end it. It ends at a line containing \
+            nothing but a forward slash, exactly as in SQL*Plus. This applies to anonymous blocks (DECLARE.../BEGIN...END;) \
+            and to CREATE OR REPLACE PROCEDURE / FUNCTION / PACKAGE / PACKAGE BODY / TRIGGER / TYPE. Leave the slash out \
+            and the rest of the script is swallowed into the block.
+
+            Example:
+              ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY-MM-DD';
+              BEGIN
+                DBMS_SESSION.SET_CONTEXT('my_ctx', 'org_id', '42');
+                DBMS_OUTPUT.PUT_LINE('context set');
+              END;
+              /
+              SELECT COUNT(*) AS N FROM orders;
+
+            DBMS_OUTPUT is captured automatically on Oracle and returned per statement as "dbms_output". You do not need \
+            SET SERVEROUTPUT ON. DBMS_OUTPUT.PUT_LINE is the normal way to get values out of a block.
+
+            NOT SUPPORTED, because they are SQL*Plus client features that never reach the database - do not use them:
+            - Substitution variables (&name, DEFINE) and bind variables (VARIABLE, PRINT): write literal values instead.
+            - EXEC / EXECUTE on Oracle: write BEGIN my_proc(1); END; followed by a slash line.
+            - SHOW ERRORS: select LINE, POSITION, TEXT from USER_ERRORS instead to find out why an object would not compile.
+            - SPOOL and @file: rejected outright. Put the statements in the script argument.
+            - SET, PROMPT, COLUMN, WHENEVER, TTITLE and REM lines are ignored and reported back as skipped.
+
+            EXECUTION: statements run in order on a single database session, so ALTER SESSION, DBMS_SESSION.SET_CONTEXT, \
+            global temporary tables and package state established by one statement are still in effect for the next one. \
+            Execution stops at the first error unless continue_on_error is true. Statements are auto-committed one by one.
+
+            RETURNS JSON: statements_total, statements_executed, stopped_on_error, and results[] holding for each \
+            statement its line number, an sql preview, status (ok / error / skipped / rejected), then rows plus row_count \
+            for a query or update_count for everything else, any dbms_output lines, and the database's error message if \
+            it failed. Read the error message and the failing statement's line number before retrying.""";
+
+    /** Rows returned per statement, so that one careless SELECT cannot flood the model's context. */
+    private static final int MAX_SCRIPT_ROWS = 500;
+
+    /** DBMS_OUTPUT lines read back per statement; the rest stays buffered for the next drain. */
+    private static final int MAX_DBMS_OUTPUT_LINES = 500;
+
+    /** How much of each statement is echoed back so the model can tell which one a result belongs to. */
+    private static final int SQL_PREVIEW_LENGTH = 300;
+
+    String run_script(String script, boolean continueOnError, McpConnection mcpConnection) {
+        List<SqlScriptSplitter.Statement> statements = SqlScriptSplitter.split(script);
+        if (statements.isEmpty()) {
+            throw new ToolCallException("The script contains no statements", null);
+        }
+
+        Map<String, Object> report = new LinkedHashMap<>();
+        List<Map<String, Object>> results = new ArrayList<>();
+        boolean stopped = false;
+        int executed = 0;
+
+        try (JdbcSessionManager.Lease lease = lease(mcpConnection)) {
+            Connection connection = lease.connection();
+            boolean captureOutput = DbmsOutput.enable(connection);
+
+            for (SqlScriptSplitter.Statement statement : statements) {
+                Map<String, Object> result = new LinkedHashMap<>();
+                result.put("statement", results.size() + 1);
+                result.put("line", statement.line());
+                result.put("sql", preview(statement.sql()));
+                results.add(result);
+
+                if (!statement.executable()) {
+                    boolean rejected = statement.kind() == SqlScriptSplitter.Kind.REJECTED;
+                    result.put("status", rejected ? "rejected" : "skipped");
+                    result.put("note", statement.note());
+                    if (rejected && !continueOnError) {
+                        stopped = true;
+                        break;
+                    }
+                    continue;
+                }
+
+                executed++;
+                boolean failed = execute(connection, statement, result);
+                if (captureOutput) {
+                    // Drained even after a failure: a block often prints its way up to the point
+                    // where it broke, and those lines are the most useful thing in the response.
+                    List<String> output = DbmsOutput.drain(connection, MAX_DBMS_OUTPUT_LINES);
+                    if (!output.isEmpty()) {
+                        result.put("dbms_output", output);
+                    }
+                }
+                if (failed && !continueOnError) {
+                    stopped = true;
+                    break;
+                }
+            }
+        } catch (SQLException e) {
+            throw new ToolCallException("Script execution failed: " + e.getMessage(), e);
+        }
+
+        report.put("statements_total", statements.size());
+        report.put("statements_executed", executed);
+        report.put("stopped_on_error", stopped);
+        if (stopped) {
+            report.put("not_run", statements.size() - results.size());
+        }
+        report.put("results", results);
+        try {
+            return mapper.writeValueAsString(report);
+        } catch (Exception e) {
+            throw new ToolCallException("Failed to serialize the script results: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Runs one statement of a script, recording its outcome in {@code result}.
+     *
+     * <p>
+     * A failure is reported as data rather than thrown: the statements that already succeeded have
+     * happened and the model needs to see them, and with {@code continue_on_error} the run goes on.
+     *
+     * @return whether the statement failed
+     */
+    private boolean execute(Connection connection, SqlScriptSplitter.Statement statement,
+                            Map<String, Object> result) {
+        result.put("type", statement.kind() == SqlScriptSplitter.Kind.PLSQL_BLOCK ? "plsql_block" : "sql");
+        try (Statement stmt = connection.createStatement()) {
+            if (stmt.execute(statement.sql())) {
+                try (ResultSet rs = stmt.getResultSet()) {
+                    List<Map<String, Object>> rows = rows(rs, MAX_SCRIPT_ROWS);
+                    result.put("row_count", rows.size());
+                    if (rows.size() == MAX_SCRIPT_ROWS) {
+                        result.put("rows_truncated", true);
+                    }
+                    result.put("rows", rows);
+                }
+            } else {
+                result.put("update_count", stmt.getUpdateCount());
+            }
+            result.put("status", "ok");
+            return false;
+        } catch (SQLException e) {
+            result.put("status", "error");
+            result.put("error", e.getMessage());
+            return true;
+        }
+    }
+
+    private static String preview(String sql) {
+        String collapsed = sql.strip();
+        if (collapsed.length() <= SQL_PREVIEW_LENGTH) {
+            return collapsed;
+        }
+        return collapsed.substring(0, SQL_PREVIEW_LENGTH) + "... (truncated)";
+    }
+
+    /** Reads at most {@code limit} rows, stringifying every value as the read tools have always done. */
+    private static List<Map<String, Object>> rows(ResultSet rs, int limit) throws SQLException {
+        ResultSetMetaData metaData = rs.getMetaData();
+        List<Map<String, Object>> rows = new ArrayList<>();
+        while (rows.size() < limit && rs.next()) {
+            Map<String, Object> row = new LinkedHashMap<>();
+            for (int i = 1; i <= metaData.getColumnCount(); i++) {
+                Object value = rs.getObject(i);
+                row.put(metaData.getColumnName(i), value == null ? null : value.toString());
+            }
+            rows.add(row);
+        }
+        return rows;
     }
 
     @Tool(description = "Describe table")

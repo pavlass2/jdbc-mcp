@@ -20,7 +20,7 @@ The fork's value-add over upstream (see README.md vs README-org.md):
 ./mvnw quarkus:dev         # dev mode with live reload
 ```
 
-Requires **JDK 17** (`maven.compiler.release=17`). CI (`.github/workflows/build-test.yml`) runs `mvnw compile` then `mvnw test` on every push/PR to `main`.
+Requires **JDK 17** (`maven.compiler.release=17`). CI (`.github/workflows/build-test.yml`) runs `mvnw compile` then `mvnw test` on every push/PR to `main`, plus a separate `oracle-tests` job for the opt-in container tests (see below).
 
 ### Dependency resolution is pinned to Maven Central
 
@@ -33,6 +33,22 @@ Requires **JDK 17** (`maven.compiler.release=17`). CI (`.github/workflows/build-
 - `HttpHeaderParameterHelperTest` — plain JUnit + Mockito, no Quarkus boot. Covers individual headers, the `x-config` positional Base64 array, and its edge cases.
 - `McpTestClient` — test-only MCP JSON-RPC client over the streamable-HTTP `/mcp` endpoint. Responses may be **plain JSON or SSE**: tools taking an `McpLog` (e.g. `list_tables`) and the imperatively-registered write tools answer with `text/event-stream`, so the client parses both.
 - `ReadToolsTest`, `WriteToolsEnabledTest` (`@TestProfile` setting `enable.write.sql=true`), `SessionAffinityTest`, `SessionAffinityDisabledTest` (`@TestProfile` setting `jdbc.session.affinity=false`).
+- `SqlScriptSplitterTest` — plain JUnit, no database; the terminator rules as text. `RunScriptTest` covers the execution loop end-to-end against H2 (ordering, per-statement reporting, stop-on-error vs `continue_on_error`) and reuses `WriteToolsEnabledTest.WriteEnabledProfile` so both share one Quarkus instance.
+- `OracleScriptTest` — the Oracle-only half, against a real database in a Testcontainers `gvenzl/oracle-free:slim-faststart` container: that a stripped trailing `;` is what Oracle wants, that a `/`-terminated block and stored procedure actually compile and run, `DBMS_OUTPUT` capture (including after a failure), `q'[…]'` literals, and session state surviving from one tool call to the next. Credentials reach the server as `x-jdbc-*` headers, like a real client's.
+
+#### Running the Oracle tests
+
+`OracleScriptTest` is **opt-in** and skipped otherwise, because the image is a ~1.5 GB pull:
+
+```bash
+./mvnw test -Doracle.tests=true -Dtest=OracleScriptTest -DfailIfNoSpecifiedTests=false
+```
+
+The `oracle.tests` Maven property (default `false`) is forwarded to the test JVM by the surefire `systemPropertyVariables` block and read by `@EnabledIfSystemProperty`; the class-level condition means neither the container nor Quarkus starts when it is off. CI runs it as a separate `oracle-tests` job so the fast H2 suite still reports quickly. A Docker daemon is required when enabled.
+
+**`@Testcontainers`/`@Container` does not work under `@QuarkusTest`** — that extension starts the container from its own `beforeAll`, but Quarkus reloads the test class in its own classloader, so the copy running the tests holds a second, never-started instance and every call fails with `IllegalStateException: Mapped port can only be obtained after the container is started`. Start containers from `@BeforeAll` instead, as this class does.
+
+Anything Oracle-specific added to `run_script` belongs in this class — H2 will silently accept or reject the wrong things.
 
 `McpTestClient` performs a real `initialize` + `notifications/initialized` handshake and echoes the `Mcp-Session-Id` header, because JDBC session affinity is keyed on the MCP connection id. Call `McpTestClient.newSession()` from `@BeforeAll` in each `@QuarkusTest` class; the session is then established lazily on first use, since RestAssured is not yet pointed at the test port during a static `@BeforeAll`.
 
@@ -71,9 +87,21 @@ Nearly all server behavior lives in `src/main/java/io/quarkiverse/mcp/servers/jd
 Key points:
 - `registerDriver()` (`@Startup`) force-loads every supported JDBC driver class so `DriverManager` can find them regardless of which one a given connection URL needs.
 - **`read_query` is a static `@Tool`** — always registered.
-- **`write_query` and `create_table` are registered conditionally** at startup (`addTools()`, guarded by `enable.write.sql`) using the imperative `ToolManager` API instead of `@Tool` annotations, because Quarkus MCP has no way to conditionally include an annotated tool. Their `@Tool`-annotated method signatures are commented out directly above the real methods — keep both in sync if you change one.
+- **`write_query`, `create_table` and `run_script` are registered conditionally** at startup (`addTools()`, guarded by `enable.write.sql`) using the imperative `ToolManager` API instead of `@Tool` annotations, because Quarkus MCP has no way to conditionally include an annotated tool. The `@Tool`-annotated method signatures of the first two are commented out directly above the real methods — keep both in sync if you change one.
 - `write_query` rejects statements starting with `SELECT`; `create_table` requires `CREATE TABLE`. This is a naive prefix check, not real SQL parsing — treat as a basic guardrail, not a security boundary (see `docs/context_issue.md` for a real-world case where `read_query` executed an `INSERT`).
 - Every tool borrows a connection through `lease(McpConnection)`, which delegates to `JdbcSessionManager`. The lease **must** be closed (try-with-resources) because it holds the session lock; whether the underlying connection is also closed depends on session affinity — see below. Every tool method therefore takes an `McpConnection` parameter.
+
+### Multi-statement scripts and PL/SQL (`run_script`)
+
+`run_script` takes a whole SQL\*Plus-style script. JDBC executes exactly one statement per call — Oracle rejects both a trailing `;` on plain SQL (`ORA-00911`) and any attempt to batch statements — so the script is taken apart first by `SqlScriptSplitter` and each piece run with `Statement.execute()`.
+
+- **Terminator rules follow SQL\*Plus**, and this is the whole reason the class exists: plain SQL ends at `;` (dropped), while a PL/SQL block ends only at a line containing nothing but `/` (its own semicolons, including `END;`, are kept). Block starts are detected from the opening keywords — `DECLARE`, `BEGIN`, or `CREATE [OR REPLACE] [NON]EDITIONABLE {PROCEDURE|FUNCTION|PACKAGE|TRIGGER|TYPE|LIBRARY}` — because the decision has to be made *before* the first `;` arrives, which in `DECLARE v NUMBER;` is very early. `CREATE VIEW`/`TABLE`/`INDEX`/`SYNONYM` are deliberately not blocks.
+- Terminators inside `'…'`, `"…"`, `q'[…]'`, `--` and `/* */` are ignored.
+- **SQL\*Plus client commands are recognised, not executed** — they never reach a database and produce a baffling syntax error if passed to a driver. `SET <sqlplus-option>`, `PROMPT`, `COLUMN`, `WHENEVER`, `TTITLE`, `REM`, `SHOW ERRORS` are reported as `skipped`; `@file` and `SPOOL` as `rejected`. **Only forms that cannot be valid SQL in any supported dialect are matched** — `SET` is checked against a list of known SQL\*Plus option names precisely so PostgreSQL's `SET search_path` and MySQL's `SET autocommit` still pass through, and `SHOW` matches only `SHOW ERRORS` so MySQL's `SHOW TABLES` survives. Anything added to those lists must clear the same bar.
+- **`DbmsOutput` enables and drains `DBMS_OUTPUT` automatically** on Oracle (detected via `getDatabaseProductName()`), per statement, including after a failure — a block usually prints its way up to the point where it broke. It uses `GET_LINE` in a loop rather than `GET_LINES` to avoid vendor-specific array binding. On a non-Oracle database capture is silently off.
+- **No read-only variant is possible**: no prefix check can distinguish an anonymous block that reads from one that drops tables, so this tool sits behind `enable.write.sql` with the write tools.
+- Errors come back as data (`status: "error"` plus the driver's message) rather than as a thrown `ToolCallException`, because the statements before the failure have already happened and the model needs to see them. Execution stops at the first failure unless `continue_on_error` is set.
+- **The tool description is the user documentation.** It is a long text block in `MCPServerJDBC.RUN_SCRIPT_DESCRIPTION` spelling out the terminator rules, the DBMS_OUTPUT behaviour and the unsupported SQL\*Plus features, because a model has no other way to learn them. Keep it in step with the splitter's behaviour — if you change what is skipped, rejected or how blocks terminate, that text is part of the change.
 
 ### Per-request credentials via HTTP headers
 
@@ -117,7 +145,7 @@ Things to know before changing it:
 | Property / env var | Purpose | Default |
 |---|---|---|
 | `jdbc.url`, `jdbc.user`, `jdbc.password` | Server-wide JDBC connection info, used when the request carries no `x-jdbc-*` headers. The only source under STDIO. | - |
-| `enable.write.sql` | Enables `write_query`/`create_table` tools | `false` |
+| `enable.write.sql` | Enables the `write_query`/`create_table`/`run_script` tools | `false` |
 | `jdbc.session.affinity` | Reuse one JDBC connection per MCP connection so session state survives across tool calls | `true` |
 | `jdbc.session.idle-timeout` | How long a retained connection may sit unused before it is closed (ISO-8601 duration) | `PT10M` |
 | `jdbc.session.max` | Cap on retained connections; least-recently-used are closed past it | `16` |
