@@ -4,22 +4,25 @@ Date: 2026-07-07
 
 > **Status: fixed (2026-07-31).** See "Resolution" at the end of this document.
 > The analysis below is kept as the record of the original diagnosis.
+>
+> Schema and object names below are placeholders — the case came from a private
+> database. `APP_CONTEXT_PKG`, `PROTECTED_TABLE` and the column names stand in for
+> the real ones; nothing about the diagnosis depends on what they were called.
 
 ## Summary
 
-An MCP server exposes an Oracle 19c database through tools
+An MCP server exposed an Oracle 19c database through tools
 (`database_info`, `list_tables`, `describe_table`, `read_query`, `write_query`).
 Data in this database is partitioned by "company" context via Oracle VPD
-(row-level security), managed through the `APP_CONTEXT_PKG` package:
+(row-level security), managed through a context package:
 
-* `call app_context_pkg.set_active_company(1)` — activate context 1 (default;
-  8 is also valid)
+* `call app_context_pkg.set_active_company(1)` — activate context 1 (one of
+  several valid values)
 * `call app_context_pkg.switch_vpd_off()` — disable the VPD filter
 
 In practice, calling `set_active_company` and then querying a VPD-protected
-table (e.g. `PROTECTED_TABLE`) in a follow-up call always returns **0 rows**, even
-though the table is not empty (`ALL_TABLES.NUM_ROWS` reports hundreds of millions of rows for
-`PROTECTED_TABLE`).
+table in a follow-up call always returns **0 rows**, even though the table is
+not empty (`ALL_TABLES.NUM_ROWS` reports hundreds of millions of rows for it).
 
 ## Root cause
 
@@ -31,8 +34,8 @@ and observing different session IDs each time (e.g. `2301548428` vs `586`).
 
 `APP_CONTEXT_PKG.set_active_company` / `switch_vpd_off` set **session-scoped**
 state (almost certainly via `DBMS_SESSION.SET_CONTEXT` under an application
-context namespace used by the VPD policy on `TENANT_ID`-bearing tables).
-Since the next tool call gets a different session, the previously set
+context namespace used by the VPD policy on tables carrying a tenant-id
+column). Since the next tool call gets a different session, the previously set
 context is gone, so the VPD policy filters out all rows.
 
 ### Things tried that do NOT work around it
@@ -64,15 +67,13 @@ context is gone, so the VPD policy filters out all rows.
 
 ## Impact
 
-Any workflow that requires `set_active_company(1|8)` (or `switch_vpd_off`)
-followed by a query against VPD-protected tables (e.g. `PROTECTED_TABLE`, and any
-other table with a `TENANT_ID` column) **cannot currently be completed**
-through this MCP server in more than one tool call, because there is no way
-to guarantee the SET and the SELECT share the same Oracle session.
+Any workflow that requires `set_active_company(...)` (or `switch_vpd_off`)
+followed by a query against VPD-protected tables **cannot currently be
+completed** through this MCP server in more than one tool call, because there
+is no way to guarantee the SET and the SELECT share the same Oracle session.
 
 Unaffected: tables/queries that don't depend on VPD context work fine via
-`read_query` (e.g. `SELECT * FROM NON_VPD_TABLE`, dictionary views like
-`USER_TABLES`, `ALL_TAB_COLUMNS`).
+`read_query`, as do dictionary views like `USER_TABLES` and `ALL_TAB_COLUMNS`.
 
 ## Other issues noticed during testing (same server)
 
@@ -109,7 +110,7 @@ tool semantics.
 instead of opening and closing one per tool call. A sequence of tool calls in
 one conversation therefore runs on a single Oracle session, so
 `app_context_pkg.set_active_company(1)` in one call is still in effect for a
-`SELECT` against `PROTECTED_TABLE` in the next.
+`SELECT` against a protected table in the next.
 
 The intended workflow now works in two calls:
 
@@ -141,7 +142,7 @@ temporary-table test in `WriteToolsEnabledTest` that fails without the fix.
 `com.oracle.database.nls:orai18n` (version-matched to `ojdbc10`) is now a
 runtime dependency, which is what the
 `Non supported character set ... EE8ISO8859P2` failure in
-`list_tables`/`describe_table` was asking for. **Not verified against the real
+`list_tables`/`describe_table` was asking for. **Not verified against the
 original database** - it needs a run against an `EE8ISO8859P2` instance to
 confirm.
 
