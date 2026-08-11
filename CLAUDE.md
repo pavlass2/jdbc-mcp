@@ -76,7 +76,11 @@ quarkus.log.console.stderr=false
 ```
 (STDIO mode requires console logging disabled since stdout/stderr carry the JSON-RPC protocol.)
 
-Docker images are built from `src/main/docker/Dockerfile.jvm` (the one used by CI/publish), with `.native`, `.native-micro`, and `.legacy-jar` variants also present but not used by the publish workflow. Release publishing (`.github/workflows/docker-publish.yml`) triggers on `v*` tags: builds with `mvnw package`, then pushes `Dockerfile.jvm` image tagged with the version (and `latest` if the tag is a plain semver).
+Docker images are built from `src/main/docker/Dockerfile.jvm` (the one used by CI/publish), with `.native`, `.native-micro`, and `.legacy-jar` variants also present but not used by the publish workflow.
+
+Two workflows publish on a `v*` tag, deliberately independent so a missing Docker Hub secret cannot block the other: `docker-publish.yml` → Docker Hub `${DOCKER_USERNAME}/ora-jdbc-mcp`, and `ghcr-publish.yml` → `ghcr.io/<owner>/jdbc-mcp`. Both build with `mvnw package` and move `:latest` only for a plain semver tag. `scripts/publish.sh` does the same thing by hand for a local build; the `IMAGE_NAME` in `docker-publish.yml` and the `IMAGE` default in that script name the same Docker Hub repository and must stay in step.
+
+**`Dockerfile.jvm`'s ENTRYPOINT is `src/main/docker/entrypoint.sh`, not `run-java.sh` directly.** The script exists for one reason: under STDIO the JSON-RPC protocol travels over stdout/stderr, so `quarkus.log.console.enable` and `quarkus.log.console.stderr` must both be false, and making the caller set three environment variables to express one intent produced a failure — log lines interleaved into the protocol stream — that reads as a broken server rather than a misconfiguration. `MCP_STDIO=true` now implies the other two, unless the caller sets them explicitly. It reads them with `printenv` because the property-name forms contain dots and the shell cannot expand those. Note that `.dockerignore` excludes everything by default and allow-lists paths individually — a new file under `src/main/docker/` needs an entry there or the build fails with "not found".
 
 ## Architecture
 
@@ -152,3 +156,4 @@ Things to know before changing it:
 | `x-jdbc-url` / `x-jdbc-user` / `x-jdbc-password` (HTTP headers) | Per-request JDBC connection info, overrides server config | - |
 | `x-config` (HTTP header) | Dot-separated Base64 values encoding the three headers above, for clients limited to one custom header | - |
 | `quarkus.mcp.server.stdio.enabled` | Switch transport to STDIO | `false` |
+| `MCP_STDIO` | Container-only alias for the above that also turns off console logging (see `entrypoint.sh`) | `false` |

@@ -4,3 +4,4 @@
 !target/lib/*
 !target/quarkus-app/*
 !src/main/docker/java.security
+!src/main/docker/entrypoint.sh

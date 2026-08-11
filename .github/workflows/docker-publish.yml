@@ -5,7 +5,10 @@ on:
     tags: [ 'v*' ]
 
 env:
-  IMAGE_NAME: jdbc-mcp
+  # Pushed as ${DOCKER_USERNAME}/${IMAGE_NAME}, so this must match the Docker Hub
+  # repository published by scripts/publish.sh - otherwise a git tag and a manual push
+  # produce two different images.
+  IMAGE_NAME: ora-jdbc-mcp
 
 jobs:
   build-and-push:

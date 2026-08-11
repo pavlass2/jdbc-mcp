@@ -1,6 +1,6 @@
 # JDBC-MCP - Database Access for AI Assistants
 
-[![Docker Hub](https://img.shields.io/docker/pulls/guang1/jdbc-mcp.svg)](https://hub.docker.com/r/guang1/jdbc-mcp)
+[![Docker Hub](https://img.shields.io/docker/pulls/pavelmichalec/ora-jdbc-mcp.svg)](https://hub.docker.com/r/pavelmichalec/ora-jdbc-mcp)
 [![GitHub License](https://img.shields.io/github/license/quarkiverse/quarkus-mcp-servers)](https://github.com/quarkiverse/quarkus-mcp-servers/blob/main/LICENSE)
 
 This is a fork of the [Quarkus MCP JDBC Server](https://github.com/quarkiverse/quarkus-mcp-servers) with added features:
@@ -26,7 +26,7 @@ docker run -d --name jdbc-mcp \
   -e jdbc.user=db_user \
   -e jdbc.password=db_password \
   -e jdbc.url=jdbc:postgresql://host:port/database \
-  guang1/jdbc-mcp:latest
+  pavelmichalec/ora-jdbc-mcp:latest
 ```
 
 #### Using an Environment File
@@ -44,7 +44,7 @@ Then run:
 docker run -d --name jdbc-mcp \
   -p 8080:8080 \
   --env-file .env \
-  guang1/jdbc-mcp:latest
+  pavelmichalec/ora-jdbc-mcp:latest
 ```
 
 ### Docker Compose for SSE
@@ -63,7 +63,7 @@ services:
       - jdbc.password=db_password
       - jdbc.url=jdbc:postgresql://host:port/database
     restart: always
-    image: guang1/jdbc-mcp:latest
+    image: pavelmichalec/ora-jdbc-mcp:latest
 ```
 
 #### With Environment File
@@ -77,35 +77,45 @@ services:
     env_file:
       - .env
     restart: always
-    image: guang1/jdbc-mcp:latest
+    image: pavelmichalec/ora-jdbc-mcp:latest
 ```
 
 #### MCP SSE URL
 ```http://localhost:8080/mcp/sse```
 
 ### MCP STDIO
-**Must** pass `quarkus.mcp.server.stdio.enabled=true`, `quarkus.log.console.enable=false` and `quarkus.log.console.stderr=false` environment variables with `-i` interactive option.
-#### Simple usage
+
+Pass `MCP_STDIO=true` along with the `-i` interactive option:
+
 ```
-docker run --rm \
-  -e enable.write.sql=false \
+docker run --rm -i \
+  -e MCP_STDIO=true \
+  -e jdbc.url=jdbc:postgresql://host:port/database \
   -e jdbc.user=db_user \
   -e jdbc.password=db_password \
-  -e jdbc.url=jdbc:postgresql://host:port/database \
-  -e quarkus.mcp.server.stdio.enabled=true \
-  -e quarkus.log.console.enable=false \
-  -e quarkus.log.console.stderr=false \  
-  guang1/jdbc-mcp:latest
-``` 
+  pavelmichalec/ora-jdbc-mcp:latest
+```
+
+`-i` is required — without it the container gets no stdin and the MCP handshake never
+completes.
+
+Under STDIO the protocol travels over stdout and stderr, so console logging must be off or
+the client sees log lines where it expects JSON. `MCP_STDIO=true` turns it off for you.
+The longer form is still accepted, and setting any of these explicitly overrides the
+defaults (useful when debugging startup):
+
+```
+-e quarkus.mcp.server.stdio.enabled=true \
+-e quarkus.log.console.enable=false \
+-e quarkus.log.console.stderr=false
+```
 
 #### Using an Environment File
 ```
-docker run --rm 
+docker run --rm -i \
   --env-file .env \
-   -e quarkus.mcp.server.stdio.enabled=true \
-   -e quarkus.log.console.enable=false \
-   -e quarkus.log.console.stderr=false \  
-  guang1/jdbc-mcp:latest
+  -e MCP_STDIO=true \
+  pavelmichalec/ora-jdbc-mcp:latest
 ```
 
 ### Claude Desktop Configuration (STDIO)
@@ -119,22 +129,16 @@ To use the Docker version with Claude Desktop, add this to your `claude_desktop_
       "args": [
         "run",
         "--rm",
+        "-i",
         "-e",
-        "enable.write.sql=false",
+        "MCP_STDIO=true",
+        "-e",
+        "jdbc.url=jdbc:postgresql://host:port/database",
         "-e",
         "jdbc.user=db_user",
         "-e",
         "jdbc.password=db_password",
-        "-e",
-        "jdbc.url=jdbc:postgresql://host:port/database",
-        "-e",
-        "quarkus.mcp.server.stdio.enabled=true",
-        "-e",
-        "quarkus.log.console.enable=false",
-        "-e",
-        "quarkus.log.console.stderr=false",
-        "-i",
-        "guang1/jdbc-mcp:latest"
+        "pavelmichalec/ora-jdbc-mcp:latest"
       ]
     }
   }
@@ -150,16 +154,12 @@ To use the Docker version with Claude Desktop, add this to your `claude_desktop_
       "args": [
         "run",
         "--rm",
+        "-i",
         "--env-file",
         ".env",
         "-e",
-        "quarkus.mcp.server.stdio.enabled=true",
-        "-e",
-        "quarkus.log.console.enable=false",
-        "-e",
-        "quarkus.log.console.stderr=false",
-        "-i",
-        "guang1/jdbc-mcp:latest"
+        "MCP_STDIO=true",
+        "pavelmichalec/ora-jdbc-mcp:latest"
       ]
     }
   }
@@ -168,16 +168,52 @@ To use the Docker version with Claude Desktop, add this to your `claude_desktop_
 
 ## Using it on another machine (no clone, no build)
 
-Tagged releases are published to GitHub Container Registry by
-`.github/workflows/ghcr-publish.yml`, so any machine with Docker can run the server
-without checking out this repository:
+Any machine with Docker can run the server without checking out this repository:
 
 ```bash
-docker pull ghcr.io/<owner>/jdbc-mcp:latest
+docker pull pavelmichalec/ora-jdbc-mcp:latest
 ```
 
-If the package is private, either make it public in the repository's *Packages*
-settings or run `docker login ghcr.io` first.
+Tagged releases go to two registries, from two independent workflows, so a missing
+Docker Hub secret cannot stop the GHCR publish:
+
+| Registry | Image | Workflow | Auth to pull |
+|---|---|---|---|
+| Docker Hub | `pavelmichalec/ora-jdbc-mcp` | `.github/workflows/docker-publish.yml` | none, if the repository is public |
+| GHCR | `ghcr.io/<owner>/jdbc-mcp` | `.github/workflows/ghcr-publish.yml` | `docker login ghcr.io`, unless the package is made public |
+
+Pushing a `v*` git tag triggers both. Only a plain version number (`v1.0`, `v1.2.3`) also
+moves `:latest`, so a release candidate cannot become what everyone pulls by default.
+
+```bash
+git tag v1.0 && git push origin v1.0
+```
+
+### Publishing by hand
+
+To get a build out without going through CI — `docker login` first.
+
+Linux, macOS, Git Bash / WSL:
+
+```bash
+./scripts/publish.sh 1.0                       # pavelmichalec/ora-jdbc-mcp:1.0 and :latest
+IMAGE=ghcr.io/me/thing ./scripts/publish.sh 1.0
+PUSH=false ./scripts/publish.sh 1.0            # build and tag locally, push nothing
+```
+
+PowerShell (note that `./scripts/publish.sh` from PowerShell hands the file to Git Bash,
+which usually has a different `JAVA_HOME` — use this instead):
+
+```powershell
+.\scripts\publish.ps1 1.0
+.\scripts\publish.ps1 1.0 -Image ghcr.io/me/thing
+.\scripts\publish.ps1 1.0 -NoPush
+.\scripts\publish.ps1 1.0 -JavaHome C:\path\to\jdk-17    # if the shell default is not 17
+```
+
+Both run the test suite as part of the build (the Oracle container tests stay opt-in),
+check for JDK 17 up front, and apply the same `:latest` rule as CI. The PowerShell version
+restores your ambient `JAVA_HOME` on exit.
 
 ### GitHub Copilot CLI (`~/.copilot/mcp-config.json`)
 
@@ -193,24 +229,21 @@ starts the container on demand:
       "command": "docker",
       "args": [
         "run", "--rm", "-i",
-        "-e", "quarkus.mcp.server.stdio.enabled=true",
-        "-e", "quarkus.log.console.enable=false",
-        "-e", "quarkus.log.console.stderr=false",
+        "-e", "MCP_STDIO=true",
         "-e", "jdbc.url=jdbc:oracle:thin:@//dbhost:1521/SERVICE",
         "-e", "jdbc.user=db_user",
         "-e", "jdbc.password=db_password",
-        "ghcr.io/<owner>/jdbc-mcp:latest"
+        "pavelmichalec/ora-jdbc-mcp:latest"
       ]
     }
   }
 }
 ```
 
-Add `-e enable.write.sql=true` only if the assistant needs to modify data - or to call a
-stored procedure that sets up the session, such as an Oracle VPD context.
+Add `-e enable.write.sql=true` only if the assistant needs to modify data — or to run a
+PL/SQL block, such as one that sets up an Oracle VPD context.
 
-`-i` is required: without it the container gets no stdin and the MCP handshake never
-completes. `--rm` keeps a container from being left behind per invocation.
+`--rm` keeps a container from being left behind per invocation.
 
 Note that this file stores database credentials in plain text. Restrict its permissions,
 and prefer an account with only the rights the assistant actually needs.
@@ -228,6 +261,7 @@ and prefer an account with only the rights the assistant actually needs.
 | `jdbc.session.affinity` | Reuse one database connection per MCP client connection, so session state survives across tool calls (see below) | `true` |
 | `jdbc.session.idle-timeout` | How long an unused database connection is kept before closing (ISO-8601 duration) | `PT10M` |
 | `jdbc.session.max` | Maximum number of database connections kept open at once | `16` |
+| `MCP_STDIO` | Switch to the STDIO transport, turning off console logging with it | `false` |
 
 ### Session state across tool calls
 

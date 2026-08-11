@@ -91,6 +91,10 @@ ENV LANGUAGE='en_US:en'
 
 # We make four distinct layers so if there are application changes the library layers can be re-used
 COPY --chown=185 src/main/docker/java.security /deployments/java.security
+COPY --chown=185 src/main/docker/entrypoint.sh /deployments/entrypoint.sh
+# Done while still root, and with an explicit chmod rather than COPY --chmod, so the
+# build does not depend on BuildKit.
+RUN chmod 755 /deployments/entrypoint.sh
 COPY --chown=185 target/quarkus-app/lib/ /deployments/lib/
 COPY --chown=185 target/quarkus-app/*.jar /deployments/
 COPY --chown=185 target/quarkus-app/app/ /deployments/app/
@@ -101,5 +105,7 @@ USER 185
 ENV JAVA_OPTS_APPEND="-Dquarkus.http.host=0.0.0.0 -Djava.util.logging.manager=org.jboss.logmanager.LogManager -Djava.security.properties=/deployments/java.security"
 ENV JAVA_APP_JAR="/deployments/quarkus-run.jar"
 
-ENTRYPOINT [ "/opt/jboss/container/java/run/run-java.sh" ]
+# Not run-java.sh directly: entrypoint.sh derives the console-logging settings that STDIO
+# mode requires, then execs it. See the comments in that script.
+ENTRYPOINT [ "/deployments/entrypoint.sh" ]
 
