@@ -1,0 +1,10 @@
+# src/main/docker/entrypoint.sh is copied into a Linux image and run as the container's
+# ENTRYPOINT. Checked out with CRLF - which is what core.autocrlf=true does on Windows -
+# its shebang line ends in \r and the container dies with "bad interpreter". Keep every
+# shell script LF on all platforms regardless of the user's git config.
+*.sh text eol=lf
+mvnw text eol=lf
+Dockerfile* text eol=lf
+
+# PowerShell is happy either way; leave it to the platform default.
+*.ps1 text
