@@ -261,6 +261,10 @@ and prefer an account with only the rights the assistant actually needs.
 | `jdbc.session.affinity` | Reuse one database connection per MCP client connection, so session state survives across tool calls (see below) | `true` |
 | `jdbc.session.idle-timeout` | How long an unused database connection is kept before closing (ISO-8601 duration) | `PT10M` |
 | `jdbc.session.max` | Maximum number of database connections kept open at once | `16` |
+| `jdbc.session.lock-timeout` | How long a tool call waits for a session already in use before it cancels the statement holding it (ISO-8601 duration) | `PT30S` |
+| `jdbc.session.cancel-on-contention` | Allow a waiting tool call to cancel the statement blocking its session (see below) | `true` |
+| `jdbc.query.timeout` | Seconds a single statement may run before the driver aborts it; `0` disables the limit | `120` |
+| `jdbc.query.max-rows` | Rows `read_query` returns at most; `0` disables the limit | `1000` |
 | `MCP_STDIO` | Switch to the STDIO transport, turning off console logging with it | `false` |
 
 ### Session state across tool calls
@@ -275,6 +279,27 @@ This is keyed on the MCP connection, which is stable for the STDIO and SSE trans
 Clients using the streamable-HTTP transport must echo back the `Mcp-Session-Id` header
 the server returns, otherwise every call is treated as a new client and gets a new
 database session. Set `jdbc.session.affinity=false` to disable the behaviour entirely.
+
+### Runaway queries
+
+Because a connection is reused, it is also locked for the duration of each tool call —
+two calls on one MCP connection cannot run at the same time. That makes a slow query
+everybody's problem: while it runs, every later call on the same connection waits, and
+the client that asked for it has usually given up long before it finishes.
+
+Three bounds keep that from wedging the server:
+
+- **`jdbc.query.timeout`** (default 120 s) is applied to every statement, so the driver
+  aborts a runaway query instead of letting it hold the session indefinitely.
+- **`jdbc.query.max-rows`** (default 1000) caps what `read_query` returns. When a result
+  is cut, the response is an object — `{"rows_truncated": true, "row_limit": N, "rows": [...]}` —
+  instead of the usual bare array, so the caller can tell the difference between "that was
+  everything" and "there was more". Narrow the query or add your own `LIMIT`/`FETCH FIRST`.
+- **`jdbc.session.lock-timeout`** (default 30 s) bounds how long a call waits for a busy
+  session. Past it, the statement holding the session is cancelled and the lock taken over,
+  which is what lets the server recover on its own from an abandoned call. Set
+  `jdbc.session.cancel-on-contention=false` to fail the waiting call instead — but note that
+  a genuinely stuck query will then keep blocking the connection until it ends by itself.
 
 ### Multi-statement scripts and PL/SQL
 

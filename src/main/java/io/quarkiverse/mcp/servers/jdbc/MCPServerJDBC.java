@@ -52,6 +52,24 @@ public class MCPServerJDBC {
     @ConfigProperty(name = "jdbc.password")
     Optional<String> jdbcPassword;
 
+    /**
+     * Seconds a single statement may run before the driver aborts it; 0 disables the limit.
+     *
+     * <p>
+     * Without this a runaway query keeps its MCP session locked long after the client has given up
+     * waiting for the answer, and every later tool call queues behind it.
+     */
+    @ConfigProperty(name = "jdbc.query.timeout", defaultValue = "120")
+    int queryTimeoutSeconds;
+
+    /**
+     * Rows {@code read_query} returns at most; 0 disables the limit. A result that does not fit is
+     * cut and flagged rather than spending minutes being materialised and serialised into a
+     * response no model can read anyway.
+     */
+    @ConfigProperty(name = "jdbc.query.max-rows", defaultValue = "1000")
+    int maxRows;
+
     @Startup
     void registerDriver() {
         try {
@@ -139,17 +157,49 @@ public class MCPServerJDBC {
         }
     }
 
-    @Tool(description = "Execute a SELECT query on the jdbc database")
+    @Tool(description = "Execute a SELECT query on the jdbc database."
+            + " Returns a JSON array of rows. If the result exceeds the server's row limit it is cut short and"
+            + " returned as {\"rows_truncated\": true, \"row_limit\": n, \"rows\": [...]} instead - narrow the query"
+            + " rather than assuming you have seen everything. Statements are subject to a server-side timeout,"
+            + " so prefer indexed, selective queries over full scans of large tables.")
     String read_query(@ToolArg(description = "SELECT SQL query to execute") String query, McpConnection mcpConnection) {
         try (JdbcSessionManager.Lease lease = lease(mcpConnection);
-             Statement stmt = lease.connection().createStatement();
+             Statement stmt = newStatement(lease);
              ResultSet rs = stmt.executeQuery(query)) {
 
-            return mapper.writeValueAsString(rows(rs, Integer.MAX_VALUE));
+            if (maxRows <= 0) {
+                return mapper.writeValueAsString(rows(rs, Integer.MAX_VALUE));
+            }
+            // Read one row past the limit: that extra row is the only way to tell "exactly maxRows
+            // rows matched" from "there were more and we stopped".
+            List<Map<String, Object>> rows = rows(rs, maxRows + 1);
+            if (rows.size() <= maxRows) {
+                return mapper.writeValueAsString(rows);
+            }
+            rows.remove(rows.size() - 1);
+            Map<String, Object> truncated = new LinkedHashMap<>();
+            truncated.put("rows_truncated", true);
+            truncated.put("row_limit", maxRows);
+            truncated.put("rows", rows);
+            return mapper.writeValueAsString(truncated);
 
         } catch (Exception e) {
             throw new ToolCallException("Query execution failed: " + e.getMessage(), e);
         }
+    }
+
+    /**
+     * Creates a statement that cannot outstay its welcome: it carries the configured query timeout
+     * and is published on the lease, so that a later tool call blocked on this session can cancel
+     * it instead of waiting for it.
+     */
+    private Statement newStatement(JdbcSessionManager.Lease lease) throws SQLException {
+        Statement stmt = lease.connection().createStatement();
+        if (queryTimeoutSeconds > 0) {
+            stmt.setQueryTimeout(queryTimeoutSeconds);
+        }
+        lease.track(stmt);
+        return stmt;
     }
 
     @Startup
@@ -199,7 +249,7 @@ public class MCPServerJDBC {
         }
 
         try (JdbcSessionManager.Lease lease = lease(mcpConnection);
-             Statement stmt = lease.connection().createStatement()) {
+             Statement stmt = newStatement(lease)) {
             stmt.executeUpdate(query);
             return "Query executed successfully";
         } catch (Exception e) {
@@ -328,7 +378,7 @@ public class MCPServerJDBC {
                 }
 
                 executed++;
-                boolean failed = execute(connection, statement, result);
+                boolean failed = execute(lease, statement, result);
                 if (captureOutput) {
                     // Drained even after a failure: a block often prints its way up to the point
                     // where it broke, and those lines are the most useful thing in the response.
@@ -369,10 +419,10 @@ public class MCPServerJDBC {
      *
      * @return whether the statement failed
      */
-    private boolean execute(Connection connection, SqlScriptSplitter.Statement statement,
+    private boolean execute(JdbcSessionManager.Lease lease, SqlScriptSplitter.Statement statement,
                             Map<String, Object> result) {
         result.put("type", statement.kind() == SqlScriptSplitter.Kind.PLSQL_BLOCK ? "plsql_block" : "sql");
-        try (Statement stmt = connection.createStatement()) {
+        try (Statement stmt = newStatement(lease)) {
             if (stmt.execute(statement.sql())) {
                 try (ResultSet rs = stmt.getResultSet()) {
                     List<Map<String, Object>> rows = rows(rs, MAX_SCRIPT_ROWS);

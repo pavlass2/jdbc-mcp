@@ -3,6 +3,7 @@ package io.quarkiverse.mcp.servers.jdbc;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.SQLException;
+import java.sql.Statement;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -71,6 +72,21 @@ public class JdbcSessionManager {
     boolean affinityEnabled;
 
     /**
+     * How long a tool call waits for the session lock before it gives up. Without a bound here a
+     * single stuck call wedges every later call on the same MCP connection for as long as it runs.
+     */
+    @ConfigProperty(name = "jdbc.session.lock-timeout", defaultValue = "PT30S")
+    Duration lockTimeout;
+
+    /**
+     * Whether a call that cannot get the lock may cancel the statement currently holding it. This
+     * is what lets the server recover on its own from an abandoned call - see
+     * {@link #lockOrFail(Session, String)}.
+     */
+    @ConfigProperty(name = "jdbc.session.cancel-on-contention", defaultValue = "true")
+    boolean cancelOnContention;
+
+    /**
      * Used only to notice that an MCP client has gone away so its database session can be released
      * without waiting out the idle timeout. This is extension-internal API - see the note in
      * CLAUDE.md about checking it when upgrading {@code io.quarkiverse.mcp}.
@@ -84,6 +100,9 @@ public class JdbcSessionManager {
 
     /** Seconds allowed for the liveness check performed before a retained connection is handed out. */
     private static final int VALIDATION_TIMEOUT_SECONDS = 5;
+
+    /** Seconds shutdown waits for a running tool call to let go of its session before closing it anyway. */
+    private static final int SHUTDOWN_LOCK_TIMEOUT_SECONDS = 5;
 
     @PostConstruct
     void startSweeper() {
@@ -108,12 +127,24 @@ public class JdbcSessionManager {
         }
         for (String key : List.copyOf(sessions.keySet())) {
             Session session = sessions.remove(key);
-            if (session != null) {
-                session.lock.lock();
-                try {
-                    session.evicted = true;
-                    closeQuietly(session.connection);
-                } finally {
+            if (session == null) {
+                continue;
+            }
+            // Never block shutdown on a call that is still running: cut its statement short, give
+            // it a moment to unwind, then close the connection whether it let go or not.
+            session.cancelActiveStatement();
+            boolean locked = false;
+            try {
+                locked = session.lock.tryLock(SHUTDOWN_LOCK_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            try {
+                session.evicted = true;
+                closeQuietly(session.connection);
+                session.connection = null;
+            } finally {
+                if (locked) {
                     session.lock.unlock();
                 }
             }
@@ -138,7 +169,7 @@ public class JdbcSessionManager {
 
         while (true) {
             Session session = sessions.computeIfAbsent(mcpConnectionId, key -> new Session());
-            session.lock.lock();
+            lockOrFail(session, mcpConnectionId);
             if (session.evicted) {
                 // The sweeper removed this session between the lookup and the lock; try again and
                 // we will create a fresh one.
@@ -156,6 +187,43 @@ public class JdbcSessionManager {
                 session.lock.unlock();
                 throw e;
             }
+        }
+    }
+
+    /**
+     * Takes the session lock, waiting at most {@link #lockTimeout}.
+     *
+     * <p>
+     * The lock is held for a whole tool call, so whoever holds it is running a statement. If that
+     * statement outlives the wait, the caller is in one of two situations and neither is worth
+     * waiting out: the holder is an <em>abandoned</em> call whose MCP client already timed out and
+     * will never read the result, or it is a query so slow that no answer will arrive in time
+     * anyway. Blocking indefinitely would queue up every later call on this MCP connection behind
+     * it - the server would look completely dead until the query finished or it was restarted.
+     * So the holder's statement is cancelled and the lock is waited for once more.
+     */
+    private void lockOrFail(Session session, String mcpConnectionId) throws SQLException {
+        if (awaitLock(session)) {
+            return;
+        }
+        if (cancelOnContention) {
+            Log.warnf("A tool call on MCP connection %s has held its JDBC session for longer than %s;"
+                    + " cancelling its statement so the session can be reused", mcpConnectionId, lockTimeout);
+            session.cancelActiveStatement();
+            if (awaitLock(session)) {
+                return;
+            }
+        }
+        throw new SQLException("Another tool call is still running on this MCP session and did not release it"
+                + " within " + lockTimeout + ". Wait for it to finish, or run a smaller query.");
+    }
+
+    private boolean awaitLock(Session session) throws SQLException {
+        try {
+            return session.lock.tryLock(lockTimeout.toMillis(), TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new SQLException("Interrupted while waiting for the JDBC session", e);
         }
     }
 
@@ -278,10 +346,32 @@ public class JdbcSessionManager {
         private long lastUsedNanos = System.nanoTime();
         private boolean evicted;
 
+        /**
+         * The statement of the tool call currently holding the lock, so that a later call can cut
+         * it short. Written by the lock holder and read by other threads, hence volatile.
+         */
+        private volatile Statement activeStatement;
+
         boolean matches(String url, String user, String password) {
             return Objects.equals(this.url, url)
                     && Objects.equals(this.user, user)
                     && Objects.equals(this.password, password);
+        }
+
+        /**
+         * Best effort: {@link Statement#cancel()} is safe to call from another thread, but a driver
+         * may refuse it, and the statement may finish between the read and the call.
+         */
+        void cancelActiveStatement() {
+            Statement statement = activeStatement;
+            if (statement == null) {
+                return;
+            }
+            try {
+                statement.cancel();
+            } catch (SQLException | RuntimeException e) {
+                Log.debugf(e, "Failed to cancel the statement holding a JDBC session");
+            }
         }
     }
 
@@ -304,6 +394,17 @@ public class JdbcSessionManager {
             return connection;
         }
 
+        /**
+         * Publishes the statement this tool call is about to run, so that a later call blocked on
+         * the session can cancel it instead of waiting forever. Called for every statement; the
+         * last one wins, which is what matters because only the running one can be stuck.
+         */
+        public void track(Statement statement) {
+            if (session != null) {
+                session.activeStatement = statement;
+            }
+        }
+
         /** True when the connection outlives this tool call and keeps its session state. */
         public boolean retained() {
             return session != null;
@@ -319,6 +420,7 @@ public class JdbcSessionManager {
                 closeQuietly(connection);
                 return;
             }
+            session.activeStatement = null;
             session.lastUsedNanos = System.nanoTime();
             session.lock.unlock();
         }
