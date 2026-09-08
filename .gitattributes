@@ -8,3 +8,7 @@ Dockerfile* text eol=lf
 
 # PowerShell is happy either way; leave it to the platform default.
 *.ps1 text
+
+# .mvn/wrapper/maven-wrapper.jar is committed on purpose (see CLAUDE.md); make sure no
+# eol normalisation can ever touch it.
+*.jar binary

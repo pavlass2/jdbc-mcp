@@ -22,6 +22,12 @@ The fork's value-add over upstream (see README.md vs README-org.md):
 
 Requires **JDK 17** (`maven.compiler.release=17`). CI (`.github/workflows/build-test.yml`) runs `mvnw compile` then `mvnw test` on every push/PR to `main`, plus a separate `oracle-tests` job for the opt-in container tests (see below).
 
+### `.mvn/wrapper/maven-wrapper.jar` is committed on purpose
+
+`.mvn/wrapper/.gitignore` used to exclude it, leaving `mvnw` to fetch the jar from Maven Central on every run. That download is `curl --silent ... -f -L || rm -f "$wrapperJarPath"`: when it fails the jar is deleted, the script carries on, and the build dies with `Could not find or load main class org.apache.maven.wrapper.MavenWrapperMain` and no hint as to why. It failed exactly that way in CI run #6 while succeeding in the runs either side of it — a transient network blip, not a code change. Committing the 63 KB jar removes the per-build network dependency entirely, which is what upstream `mvn wrapper:wrapper` does by default anyway. Don't re-add that `.gitignore`.
+
+(Note that `maven-wrapper.properties` says `distributionType=source` while `mvnw` is the older jar-launching script that ignores the setting. Harmless, but don't "tidy" one without regenerating the other with `mvn wrapper:wrapper`.)
+
 ### Dependency resolution is pinned to Maven Central
 
 `.mvn/maven.config` applies `-s .mvn/settings-central.xml` and `-Dmaven.repo.local=.mvn/repository` to every Maven invocation in this project. This deliberately bypasses `~/.m2/settings.xml`, which on the maintainer's machine installs a `<mirrorOf>*</mirrorOf>` mirror pointing at an internal Nexus over plain HTTP. Don't remove these or add a mirror to `settings-central.xml`. The project-local repository is gitignored, so a first build re-downloads (~150 MB).
