@@ -166,55 +166,6 @@ To use the Docker version with Claude Desktop, add this to your `claude_desktop_
 }
 ```
 
-## Using it on another machine (no clone, no build)
-
-Any machine with Docker can run the server without checking out this repository:
-
-```bash
-docker pull pavelmichalec/ora-jdbc-mcp:latest
-```
-
-Tagged releases go to two registries, from two independent workflows, so a missing
-Docker Hub secret cannot stop the GHCR publish:
-
-| Registry | Image | Workflow | Auth to pull |
-|---|---|---|---|
-| Docker Hub | `pavelmichalec/ora-jdbc-mcp` | `.github/workflows/docker-publish.yml` | none, if the repository is public |
-| GHCR | `ghcr.io/<owner>/jdbc-mcp` | `.github/workflows/ghcr-publish.yml` | `docker login ghcr.io`, unless the package is made public |
-
-Pushing a `v*` git tag triggers both. Only a plain version number (`v1.0`, `v1.2.3`) also
-moves `:latest`, so a release candidate cannot become what everyone pulls by default.
-
-```bash
-git tag v1.0 && git push origin v1.0
-```
-
-### Publishing by hand
-
-To get a build out without going through CI — `docker login` first.
-
-Linux, macOS, Git Bash / WSL:
-
-```bash
-./scripts/publish.sh 1.0                       # pavelmichalec/ora-jdbc-mcp:1.0 and :latest
-IMAGE=ghcr.io/me/thing ./scripts/publish.sh 1.0
-PUSH=false ./scripts/publish.sh 1.0            # build and tag locally, push nothing
-```
-
-PowerShell (note that `./scripts/publish.sh` from PowerShell hands the file to Git Bash,
-which usually has a different `JAVA_HOME` — use this instead):
-
-```powershell
-.\scripts\publish.ps1 1.0
-.\scripts\publish.ps1 1.0 -Image ghcr.io/me/thing
-.\scripts\publish.ps1 1.0 -NoPush
-.\scripts\publish.ps1 1.0 -JavaHome C:\path\to\jdk-17    # if the shell default is not 17
-```
-
-Both run the test suite as part of the build (the Oracle container tests stay opt-in),
-check for JDK 17 up front, and apply the same `:latest` rule as CI. The PowerShell version
-restores your ambient `JAVA_HOME` on exit.
-
 ### GitHub Copilot CLI (`~/.copilot/mcp-config.json`)
 
 STDIO transport, so there is no port to manage and no server to keep running - Copilot
